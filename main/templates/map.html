@@ -66,9 +66,18 @@
 
   .city-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
   .route-arrow { color: var(--accent); font-size: 0.8rem; }
+  .route-status { font-size: 0.65rem; color: var(--muted); margin-left: auto; }
+  .route-status.ok { color: #22c55e; }
 
-  /* Loading indicator */
-  .route-loading { font-size: 0.7rem; color: var(--muted); margin-left: auto; }
+  .loading-bar {
+    position: fixed; top: 0; left: 0; right: 0; height: 3px;
+    background: linear-gradient(90deg, var(--accent), #fb923c);
+    z-index: 9999; transform-origin: left;
+    animation: loadpulse 1.5s ease-in-out infinite;
+    display: none;
+  }
+  .loading-bar.active { display: block; }
+  @keyframes loadpulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
 
   .offline-btn { margin: 1rem; padding: 0.7rem; background: rgba(249,115,22,0.15); border: 1px solid rgba(249,115,22,0.3); border-radius: 8px; color: var(--accent); font-family: 'DM Sans', sans-serif; font-size: 0.85rem; cursor: pointer; text-align: center; transition: background 0.2s; flex-shrink: 0; }
   .offline-btn:hover { background: rgba(249,115,22,0.25); }
@@ -82,7 +91,6 @@
   .popup-route { font-family: 'Syne', sans-serif; font-size: 0.95rem; font-weight: 700; margin-bottom: 6px; }
   .popup-row { font-size: 0.8rem; color: #94a3b8; margin-top: 3px; display: flex; align-items: center; gap: 5px; }
   .popup-row strong { color: #f1f5f9; }
-  .popup-detail { font-size: 0.78rem; color: #94a3b8; }
 
   .track-panel { position: absolute; bottom: 24px; right: 24px; z-index: 999; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1rem 1.2rem; min-width: 220px; display: none; }
   .track-panel.active { display: block; }
@@ -94,6 +102,8 @@
 </style>
 </head>
 <body>
+
+<div class="loading-bar" id="loadingBar"></div>
 
 <nav>
   <a href="/" class="logo">Bus<span>Go</span></a>
@@ -124,7 +134,7 @@
   <div id="map"></div>
 
   <div class="track-panel" id="trackPanel">
-    <span class="track-close" onclick="document.getElementById('trackPanel').classList.remove('active')">✕</span>
+    <span class="track-close" onclick="document.getElementById('trackPanel').classList.remove('active');clearInterval(window._trackInterval);">✕</span>
     <div class="track-title">🚌 Live Tracking</div>
     <div class="track-bus" id="trackInfo">Select a route to simulate</div>
   </div>
@@ -154,7 +164,7 @@ cities.forEach(city => {
 
   marker.bindPopup(`
     <div class="popup-city">📍 ${city.name}</div>
-    <div class="popup-detail">${city.lat.toFixed(4)}, ${city.lng.toFixed(4)}</div>
+    <div style="font-size:0.78rem;color:#94a3b8">${city.lat.toFixed(4)}, ${city.lng.toFixed(4)}</div>
   `);
 
   cityMarkers[city.name] = marker;
@@ -166,162 +176,127 @@ cities.forEach(city => {
   cityList.appendChild(item);
 });
 
-// ── Road routing via OSRM (free, no API key) ─────────────
-// This draws the bus route ALONG REAL ROADS instead of straight lines over ocean
+// ── Real road routing via OSRM (100% free, no API key) ───
+// OSRM uses OpenStreetMap data and routes along actual roads
+async function fetchOSRM(fromLat, fromLng, toLat, toLng) {
+  const url = `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?overview=full&geometries=geojson`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.code === 'Ok' && data.routes && data.routes[0]) {
+      return data.routes[0].geometry.coordinates.map(([lng, lat]) => [lat, lng]);
+    }
+  } catch(e) {
+    clearTimeout(t);
+    console.warn('OSRM failed:', e.message);
+  }
+  return null;
+}
+
+// Fallback: curved inland line (avoids drawing over ocean)
+function buildCurvedLine(lat1, lng1, lat2, lng2) {
+  const steps = 40;
+  const pts = [];
+  // Midpoint pushed inland (away from coast)
+  const midLat = (lat1 + lat2) / 2;
+  // For east-coast routes, nudge midpoint west to avoid ocean
+  const nudge = (lng1 > -85 && lng2 > -85) ? -1.5 : 0;
+  const midLng = (lng1 + lng2) / 2 + nudge;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const lat = (1-t)*(1-t)*lat1 + 2*(1-t)*t*midLat + t*t*lat2;
+    const lng = (1-t)*(1-t)*lng1 + 2*(1-t)*t*midLng + t*t*lng2;
+    pts.push([lat, lng]);
+  }
+  return pts;
+}
+
+// ── Draw all routes ───────────────────────────────────────
 const routeList = document.getElementById('routeList');
 const drawnRoutes = [];
+const loadingBar = document.getElementById('loadingBar');
 
-async function fetchRoadRoute(fromLat, fromLng, toLat, toLng) {
-  // Try OpenRouteService (free, no key needed for this endpoint)
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
-  try {
-    const body = {
-      coordinates: [[fromLng, fromLat], [toLng, toLat]],
-      instructions: false
-    };
-    const res = await fetch("https://api.openrouteservice.org/v2/directions/driving-car/geojson", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": "5b3ce3597851110001cf6248a2e9a8b9a3f84b1bb4a1e5a5f1a0e1d4" },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-    if (res.ok) {
-      const data = await res.json();
-      const coords = data.features[0].geometry.coordinates.map(([lng, lat]) => [lat, lng]);
-      if (coords.length > 2) { console.log("ORS routing OK:", fromLat, toLat, coords.length, "pts"); return coords; }
-    }
-  } catch(e) {
-    clearTimeout(timeout);
-    console.warn("ORS failed:", e.message);
-  }
-
-  // Fallback 2: OSRM
-  const controller2 = new AbortController();
-  const timeout2 = setTimeout(() => controller2.abort(), 8000);
-  try {
-    const url = `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?overview=full&geometries=geojson`;
-    const res2 = await fetch(url, { signal: controller2.signal });
-    clearTimeout(timeout2);
-    const data2 = await res2.json();
-    if (data2.code === "Ok" && data2.routes && data2.routes.length > 0) {
-      const coords2 = data2.routes[0].geometry.coordinates.map(([lng, lat]) => [lat, lng]);
-      if (coords2.length > 2) { console.log("OSRM routing OK"); return coords2; }
-    }
-  } catch(e) {
-    clearTimeout(timeout2);
-    console.warn("OSRM also failed:", e.message);
-  }
-
-  // Final fallback: inland waypoint routing to avoid ocean
-  console.warn("Using inland waypoint fallback for", fromLat, toLat);
-  return buildInlandRoute(fromLat, fromLng, toLat, toLng);
-}
-
-// Builds a route via inland waypoints to avoid the ocean
-function buildInlandRoute(lat1, lng1, lat2, lng2) {
-  // For US East Coast: push route inland (westward) to avoid ocean
-  const isEastCoast = lng1 > -80 && lng2 > -80;
-  const points = [];
-  const steps = 30;
-
-  if (isEastCoast) {
-    // Force midpoint to be clearly inland (westward)
-    const midLat = (lat1 + lat2) / 2;
-    const midLng = Math.min(lng1, lng2) - 0.3; // push west/inland
-    for (let i = 0; i <= steps; i++) {
-      const t = i / steps;
-      const lat = (1-t)*(1-t)*lat1 + 2*(1-t)*t*midLat + t*t*lat2;
-      const lng = (1-t)*(1-t)*lng1 + 2*(1-t)*t*midLng + t*t*lng2;
-      points.push([lat, lng]);
-    }
-  } else {
-    // Generic curve for non-East-Coast routes
-    const midLat = (lat1 + lat2) / 2 + Math.abs(lat2 - lat1) * 0.1;
-    const midLng = (lng1 + lng2) / 2;
-    for (let i = 0; i <= steps; i++) {
-      const t = i / steps;
-      const lat = (1-t)*(1-t)*lat1 + 2*(1-t)*t*midLat + t*t*lat2;
-      const lng = (1-t)*(1-t)*lng1 + 2*(1-t)*t*midLng + t*t*lng2;
-      points.push([lat, lng]);
-    }
-  }
-  return points;
-}
+// Rate-limit OSRM calls — 1 per second to be respectful
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function drawAllRoutes() {
+  loadingBar.classList.add('active');
+  let done = 0;
+
   for (const route of routes) {
+    const statusId = `rs-${done}`;
     const item = document.createElement('div');
     item.className = 'route-item';
     item.innerHTML = `
       <span>${route.from}</span>
       <span class="route-arrow">→</span>
       <span>${route.to}</span>
-      <span class="route-loading" id="loading-${route.from}-${route.to}">⏳</span>
+      <span class="route-status" id="${statusId}">⏳</span>
     `;
     routeList.appendChild(item);
 
-    // Fetch real road path
-    const roadPoints = await fetchRoadRoute(
+    // Fetch real road route from OSRM
+    const roadPoints = await fetchOSRM(
       route.from_lat, route.from_lng,
       route.to_lat, route.to_lng
     );
 
-    // Remove loading spinner
-    const loader = document.getElementById(`loading-${route.from}-${route.to}`);
-    if (loader) loader.remove();
+    const pts = roadPoints || buildCurvedLine(
+      route.from_lat, route.from_lng,
+      route.to_lat, route.to_lng
+    );
 
-    const line = L.polyline(roadPoints, {
-      color: '#f97316', weight: 3, opacity: 0.7, dashArray: '10, 6'
+    const statusEl = document.getElementById(statusId);
+    if (statusEl) {
+      statusEl.textContent = roadPoints ? '🛣' : '〰';
+      if (roadPoints) statusEl.classList.add('ok');
+    }
+
+    const line = L.polyline(pts, {
+      color: '#f97316', weight: 3, opacity: 0.75, dashArray: '10, 6'
     }).addTo(map);
 
-    // Build popup with time info
-    let popupHtml = `<div class="popup-route">${route.from} → ${route.to}</div>`;
-    popupHtml += `<div class="popup-row">🚌 <strong>${route.trips}</strong> trip${route.trips !== 1 ? 's' : ''} available</div>`;
-    if (route.dep_time && route.arr_time) {
-      popupHtml += `<div class="popup-row">🕐 Departs: <strong>${route.dep_time}</strong></div>`;
-      popupHtml += `<div class="popup-row">🏁 Arrives: <strong>${route.arr_time}</strong></div>`;
-    }
-    if (route.bus_name) {
-      popupHtml += `<div class="popup-row">🚍 <strong>${route.bus_name}</strong></div>`;
-    }
-    if (route.price) {
-      popupHtml += `<div class="popup-row">💵 From <strong>$${route.price}</strong></div>`;
-    }
-    if (route.distance_km) {
-      popupHtml += `<div class="popup-row">📏 <strong>${route.distance_km} km</strong></div>`;
-    }
-
-    line.bindPopup(popupHtml);
+    // Popup
+    let html = `<div class="popup-route">${route.from} → ${route.to}</div>`;
+    html += `<div class="popup-row">🚌 <strong>${route.trips}</strong> trip${route.trips !== 1 ? 's' : ''} available</div>`;
+    if (route.dep_time) html += `<div class="popup-row">🕐 Departs: <strong>${route.dep_time}</strong></div>`;
+    if (route.arr_time) html += `<div class="popup-row">🏁 Arrives: <strong>${route.arr_time}</strong></div>`;
+    if (route.bus_name) html += `<div class="popup-row">🚍 <strong>${route.bus_name}</strong></div>`;
+    if (route.price)    html += `<div class="popup-row">💵 From <strong>$${route.price}</strong></div>`;
+    if (route.distance_km) html += `<div class="popup-row">📏 <strong>${route.distance_km} km</strong></div>`;
+    line.bindPopup(html);
 
     line.on('mouseover', () => line.setStyle({ color: '#fb923c', weight: 5, opacity: 1 }));
-    line.on('mouseout', () => line.setStyle({ color: '#f97316', weight: 3, opacity: 0.7 }));
+    line.on('mouseout',  () => line.setStyle({ color: '#f97316', weight: 3, opacity: 0.75 }));
 
-    // Store road points for bus tracking
-    drawnRoutes.push({ line, route, roadPoints });
+    drawnRoutes.push({ line, route, pts });
 
     item.onclick = () => {
       map.fitBounds(line.getBounds(), { padding: [60, 60] });
       line.openPopup();
-      simulateTracking(route, roadPoints);
+      simulateTracking(route, pts);
     };
+
+    done++;
+    // 800ms gap between OSRM calls to avoid rate limiting
+    await sleep(800);
   }
+
+  loadingBar.classList.remove('active');
 }
 
 drawAllRoutes();
 
-// ── Live bus tracking along road path ────────────────────
-let trackingBus = null;
-let trackStep = 0;
-let trackPath = [];
+// ── Live bus tracking ────────────────────────────────────
+function simulateTracking(route, pts) {
+  if (window._trackingBus) map.removeLayer(window._trackingBus);
+  clearInterval(window._trackInterval);
 
-function simulateTracking(route, roadPoints) {
-  if (trackingBus) map.removeLayer(trackingBus);
-  trackStep = 0;
-  trackPath = roadPoints;
-
-  trackingBus = L.marker(roadPoints[0], {
+  window._trackingBus = L.marker(pts[0], {
     icon: L.divIcon({
       html: '<div style="font-size:1.5rem;filter:drop-shadow(0 2px 6px rgba(0,0,0,0.6))">🚌</div>',
       iconSize: [28, 28], iconAnchor: [14, 14], className: ''
@@ -329,35 +304,26 @@ function simulateTracking(route, roadPoints) {
   }).addTo(map);
 
   const panel = document.getElementById('trackPanel');
-  const info = document.getElementById('trackInfo');
+  const info  = document.getElementById('trackInfo');
   panel.classList.add('active');
+  info.textContent = `${route.from} → ${route.to}${route.dep_time ? ' • Departs ' + route.dep_time : ''}`;
 
-  let infoText = `${route.from} → ${route.to}`;
-  if (route.dep_time) infoText += ` • Departs ${route.dep_time}`;
-  info.textContent = infoText;
-
-  // Animate along road segments
-  let segIndex = 0;
-  let segProgress = 0;
-  clearInterval(window._trackInterval);
-
+  let seg = 0, prog = 0;
   window._trackInterval = setInterval(() => {
-    if (segIndex >= trackPath.length - 1) { segIndex = 0; }
-    segProgress += 0.04;
-    if (segProgress >= 1) { segProgress = 0; segIndex++; }
-    if (segIndex >= trackPath.length - 1) { segIndex = 0; }
-
-    const from = trackPath[segIndex];
-    const to = trackPath[Math.min(segIndex + 1, trackPath.length - 1)];
-    const lat = from[0] + (to[0] - from[0]) * segProgress;
-    const lng = from[1] + (to[1] - from[1]) * segProgress;
-    trackingBus.setLatLng([lat, lng]);
-  }, 100);
+    prog += 0.03;
+    if (prog >= 1) { prog = 0; seg++; }
+    if (seg >= pts.length - 1) { seg = 0; }
+    const a = pts[seg], b = pts[Math.min(seg + 1, pts.length - 1)];
+    window._trackingBus.setLatLng([
+      a[0] + (b[0] - a[0]) * prog,
+      a[1] + (b[1] - a[1]) * prog
+    ]);
+  }, 80);
 }
 
-// ── Save offline ──────────────────────────────────────────
+// ── Offline hint ─────────────────────────────────────────
 function saveOffline() {
-  alert('Browse the map areas you want to use offline — your browser automatically caches the map tiles. They will be available even without internet next time.');
+  alert('Pan and zoom around the map areas you want offline — your browser caches the tiles automatically. They will load without internet next time.');
 }
 
 // ── Fit to all cities ─────────────────────────────────────
@@ -366,6 +332,5 @@ if (cities.length > 0) {
   map.fitBounds(group.getBounds(), { padding: [40, 40] });
 }
 </script>
-
 </body>
 </html>
