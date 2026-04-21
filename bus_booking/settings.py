@@ -85,28 +85,16 @@ WSGI_APPLICATION = 'bus_booking.wsgi.application'
 # Uses PostgreSQL on Railway (DATABASE_URL set automatically)
 # Falls back to SQLite locally
 import urllib.parse
-DATABASE_URL = os.environ.get('DATABASE_URL', '')
-if DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace('railwaypostgresql://', 'postgresql://')
-    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://')
-    p = urllib.parse.urlparse(DATABASE_URL)
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.postgresql',
-            'NAME': p.path.lstrip('/'),
-            'USER': p.username,
-            'PASSWORD': p.password,
-            'HOST': p.hostname,
-            'PORT': p.port or 5432,
-        }
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.environ.get('PGDATABASE', 'railway'),
+        'USER': os.environ.get('PGUSER', 'postgres'),
+        'PASSWORD': os.environ.get('PGPASSWORD', ''),
+        'HOST': os.environ.get('PGHOST', 'localhost'),
+        'PORT': os.environ.get('PGPORT', '5432'),
     }
-else:
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
-        }
-    }
+}
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
     {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
