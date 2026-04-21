@@ -86,6 +86,13 @@ WSGI_APPLICATION = 'bus_booking.wsgi.application'
 # Falls back to SQLite locally
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
+# Railway sometimes provides DATABASE_URL with a non-standard scheme
+# (e.g. railwaypostgresql://) — normalize it to postgresql:// so
+# dj_database_url can parse it correctly.
+if DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace('railwaypostgresql://', 'postgresql://')
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://')
+
 if DATABASE_URL:
     DATABASES = {
         'default': dj_database_url.config(
